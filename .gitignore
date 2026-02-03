@@ -1,0 +1,7 @@
+dataset/
+sos-dataset.rar
+dataset_small/
+.claude
+__pycache__
+*.zip
+*.eqx
