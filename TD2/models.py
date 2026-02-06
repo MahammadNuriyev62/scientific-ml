@@ -37,7 +37,3 @@ class HardIC(eqx.Module):
         t, x = tx
         o = t * self.mlp(tx) + (1 - t) * self.ic(x)
         return o
-
-
-def u_scalar(model, tx):
-    return model(tx)[0]
