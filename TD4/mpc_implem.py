@@ -51,10 +51,25 @@ class NeuralODEMPC:
 
     def _rollout(self, x0, u_seq):
         # Predict learned dynamics under piecewise-constant torque u_seq.
+        # x0: (3,) state [sin, cos, omega]
+        # u_seq: (horizon_steps,) control values
         # Return: x_traj of shape (horizon_steps + 1, 3)
 
+        H = len(u_seq)
+        # Build a time grid: [0, dt, 2*dt, ..., H*dt]
+        t_grid = torch.linspace(0.0, H * self.dt, H + 1, device=self.device)
 
-        #TODO: Implement the rollout function, using the neural ODE model to predict the trajectory of the pendulum.
+        # Build piecewise-constant control: at each grid point, use the
+        # control for that interval (last point repeats the final control)
+        tau_pc = torch.cat([u_seq, u_seq[-1:]], dim=0)  # (H+1,)
+        tau_pc = tau_pc.unsqueeze(0)  # (1, H+1) batch dim
+
+        self.model.set_control(t_grid, tau_pc)
+
+        # Integrate in a single call with euler (fast for MPC optimization)
+        x = x0.unsqueeze(0)  # (1, 3)
+        x_traj = odeint(self.model, x, t_grid, method='euler')  # (H+1, 1, 3)
+        x_traj = x_traj.squeeze(1)  # (H+1, 3)
         return x_traj
 
     def _cost(self, u_np, x0_np, t_grid = None):
@@ -80,7 +95,7 @@ class NeuralODEMPC:
         )
         return total.item()
 
-    def solve(self, x0_np, u_init=None, maxiter=50, ftol=1e-3):
+    def solve(self, x0_np, u_init=None, maxiter=50, ftol=1e-7):
         # Optimize a control sequence for the current state.
         if u_init is None:
             u_init = np.zeros(self.horizon_steps, dtype=np.float32)
@@ -92,11 +107,11 @@ class NeuralODEMPC:
             args=(x0_np,),
             method="L-BFGS-B",
             bounds=bounds,
-            options={"maxiter": int(maxiter), "ftol": float(ftol)},
+            options={"maxiter": int(maxiter), "ftol": float(ftol), "eps": 1e-3},
         )
         return res.x
 
-    def step(self, x0_np, u_prev=None, maxiter=50, ftol=1e-3):
+    def step(self, x0_np, u_prev=None, maxiter=50, ftol=1e-7):
         # Compute the optimal control for the current state and return the first control input.
         if u_prev is None:
             u_prev = np.zeros(self.horizon_steps, dtype=np.float32)
@@ -154,7 +169,42 @@ def run_single_mpc_closed_loop(
     mpc_kwargs=None,
 ):
     # Closed-loop MPC on true dynamics: learned model plans, true dynamics executes.
-    #TODO implement this function, it should return the trajectory and the applied controls, 
-    #   where the controls are obtained from the MPC controller with learned model and `traj` 
-    #   should be the trajectory of the true dynamics
+    # y0_single: (2,) array [theta, omega]
+    # Returns: traj (steps+1, 2) from true dynamics, u_applied (steps,) controls
+    from pendulum_gp_dataset import rollout_closed_loop
+
+    if mpc_kwargs is None:
+        mpc_kwargs = {}
+    mpc = NeuralODEMPC(model, dt=dt, u_min=u_min, u_max=u_max, **mpc_kwargs)
+
+    y = np.array(y0_single, dtype=np.float32)  # [theta, omega]
+    traj = [y.copy()]
+    u_applied = []
+    u_prev = np.zeros(mpc.horizon_steps, dtype=np.float32)
+
+    for _ in range(int(steps)):
+        # Convert true state (theta, omega) to Neural ODE state (sin, cos, omega) for planning
+        theta_curr, omega_curr = float(y[0]), float(y[1])
+        x_sincos = np.array([np.sin(theta_curr), np.cos(theta_curr), omega_curr], dtype=np.float32)
+
+        # Plan using the learned model
+        u0, u_seq = mpc.step(x_sincos, u_prev=u_prev)
+        u_applied.append(u0)
+
+        # Execute one step on the true dynamics
+        t_step = torch.tensor([0.0, dt], dtype=torch.float32)
+        y_torch = torch.tensor(y, dtype=torch.float32).unsqueeze(0)  # (1, 2)
+
+        def control_fn(t, state, _u0=u0):
+            return torch.full((state.shape[0],), _u0)
+
+        y_next = rollout_closed_loop(y_torch, t_step, control_fn)  # (1, 2, 2)
+        y = y_next[0, -1, :].numpy().copy()  # final state (theta, omega)
+        traj.append(y.copy())
+
+        # Warm-start: shift the previous solution
+        u_prev = np.roll(u_seq, -1)
+        u_prev[-1] = 0.0
+
+    traj = np.array(traj)  # (steps+1, 2)
     return traj, np.array(u_applied, dtype=np.float32)
